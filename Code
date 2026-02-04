@@ -1,0 +1,371 @@
+#include <Keypad.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+/* =====================================================
+   GLOBAL STATES
+===================================================== */
+bool processRunning  = false;
+bool crushingStarted = false;
+bool crushingActive  = false;
+bool juicingDone     = false;
+
+unsigned long crushingStartTime = 0;
+char selectedKey = 0;
+
+/* =====================================================
+   TIMINGS
+===================================================== */
+#define CRUSHING_DURATION 20000   // 20 ثانية تقطيع
+#define JUICER_DELAY_MS   2000    // انتظار بعد التقطيع
+#define JUICER_DURATION  20000   // 20 ثانية عصر
+
+/* =====================================================
+   SERVO (Gate)
+===================================================== */
+Servo gate;
+#define GATE_SERVO_PIN 13
+#define SERVO_FORWARD_POS  20
+#define SERVO_BACKWARD_POS 100
+
+unsigned long gateOpenMs  = 700;
+unsigned long gateCloseMs = 1500;
+const int SERVO_CYCLES = 6;
+
+/* =====================================================
+   RELAYS (Active LOW)
+===================================================== */
+#define RELAY_CUTTER     3
+#define RELAY_HELZON     4
+#define RELAY_DARBABA    6
+#define RELAY_JUICER     5
+#define RELAY_CONVEYOR   9
+
+#define RELAY_ON   LOW
+#define RELAY_OFF  HIGH
+
+/* =====================================================
+   STEPPERS
+===================================================== */
+// Slider (NEMA23)
+#define SLIDER_STEP_PIN  23
+#define SLIDER_DIR_PIN   12
+#define SLIDER_ENA_PIN   24
+#define SLIDER_DIR_RIGHT LOW
+#define SLIDER_DIR_LEFT  HIGH
+#define SLIDER_STEP_DELAY_US 800
+
+// Cup Droppers (NEMA17)
+#define CUPL_STEP_PIN  27   // Large
+#define CUPL_ENA_PIN   25
+#define CUPS_STEP_PIN  31   // Small
+#define CUPS_ENA_PIN   29
+#define CUP_STEPS_360  200
+#define CUP_STEP_DELAY_US 800
+
+/* =====================================================
+   IR + LIMIT
+===================================================== */
+#define IR_CONVEYOR_PIN  10
+#define IR_LARGE_PIN     28
+#define IR_SMALL_PIN     34
+#define LIMIT_SWITCH_PIN 11
+
+/* =====================================================
+   LCD
+===================================================== */
+#define LCD_ADDRESS 0x27
+#define LCD_COLS    20
+#define LCD_ROWS    4
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+
+// ================= Pump Relay + Timings =================
+#define RELAY_PUMP  8          // غيّري 8 للبن الحقيقي عندك
+#define PUMP_TIME_SMALL  8000  // ms
+#define PUMP_TIME_LARGE  9000  // ms
+/* =====================================================
+   KEYPAD
+===================================================== */
+#define KEYPAD_ROWS 4
+#define KEYPAD_COLS 4
+
+char keys[KEYPAD_ROWS][KEYPAD_COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[KEYPAD_ROWS] = {36, 37, 38, 39};
+byte colPins[KEYPAD_COLS] = {40, 41, 42, 43};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, KEYPAD_ROWS, KEYPAD_COLS);
+
+/* =====================================================
+   PROTOTYPES
+===================================================== */
+void resetProcessFlags();
+void stageConveyorAndGate();
+void stageCrushing();
+void updateCrushing();
+void stageJuicing();
+void stageCupSlider(char key);
+void stepOnce(int stepPin, int delayUs);
+void dropCup(bool isSmall);
+
+/* =====================================================
+   SETUP
+===================================================== */
+void setup() {
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("READY");
+
+  gate.attach(GATE_SERVO_PIN);
+  gate.write(SERVO_BACKWARD_POS);
+
+  pinMode(RELAY_CUTTER, OUTPUT);
+  pinMode(RELAY_HELZON, OUTPUT);
+  pinMode(RELAY_DARBABA, OUTPUT);
+  pinMode(RELAY_JUICER, OUTPUT);
+  pinMode(RELAY_CONVEYOR, OUTPUT);
+
+  digitalWrite(RELAY_CUTTER, RELAY_OFF);
+  digitalWrite(RELAY_HELZON, RELAY_OFF);
+  digitalWrite(RELAY_DARBABA, RELAY_OFF);
+  digitalWrite(RELAY_JUICER, RELAY_OFF);
+  digitalWrite(RELAY_CONVEYOR, RELAY_OFF);
+
+  pinMode(SLIDER_STEP_PIN, OUTPUT);
+  pinMode(SLIDER_DIR_PIN, OUTPUT);
+  pinMode(SLIDER_ENA_PIN, OUTPUT);
+  digitalWrite(SLIDER_ENA_PIN, HIGH);
+
+  pinMode(CUPL_STEP_PIN, OUTPUT);
+  pinMode(CUPL_ENA_PIN, OUTPUT);
+  digitalWrite(CUPL_ENA_PIN, HIGH);
+
+  pinMode(CUPS_STEP_PIN, OUTPUT);
+  pinMode(CUPS_ENA_PIN, OUTPUT);
+  digitalWrite(CUPS_ENA_PIN, HIGH);
+
+  pinMode(IR_CONVEYOR_PIN, INPUT_PULLUP);
+  pinMode(IR_LARGE_PIN, INPUT_PULLUP);
+  pinMode(IR_SMALL_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
+}
+
+/* =====================================================
+   LOOP
+===================================================== */
+void loop() {
+
+  updateCrushing();
+
+  if (processRunning) return;
+
+  char k = keypad.getKey();
+
+  if (k == '1' || k == '2') {
+    selectedKey = k;
+    processRunning = true;
+    resetProcessFlags();
+
+    lcd.clear();
+    lcd.print("PROCESS RUN");
+
+    stageConveyorAndGate();   // Stage 1
+  }
+}
+
+/* =====================================================
+   RESET FLAGS
+===================================================== */
+void resetProcessFlags() {
+  crushingStarted = false;
+  crushingActive  = false;
+  juicingDone     = false;
+}
+
+/* =====================================================
+   STAGE 1 : Conveyor + Servo
+===================================================== */
+void stageConveyorAndGate() {
+
+  digitalWrite(RELAY_CONVEYOR, RELAY_ON);
+  delay(1000);
+
+  for (int i = 0; i < SERVO_CYCLES; i++) {
+
+    gate.write(SERVO_FORWARD_POS);
+    delay(gateOpenMs);
+
+    if (!crushingStarted && digitalRead(IR_CONVEYOR_PIN) == LOW) {
+      stageCrushing();
+      crushingStarted = true;
+    }
+
+    gate.write(SERVO_BACKWARD_POS);
+    delay(gateCloseMs);
+  }
+
+  delay(3000);
+  digitalWrite(RELAY_CONVEYOR, RELAY_OFF);
+}
+
+/* =====================================================
+   STAGE 2 : Crushing (NON-BLOCKING)
+===================================================== */
+void stageCrushing() {
+
+  // if (crushingActive) return;
+
+  digitalWrite(RELAY_DARBABA, RELAY_ON);
+  digitalWrite(RELAY_HELZON,  RELAY_ON);
+  digitalWrite(RELAY_CUTTER,  RELAY_ON);
+
+  crushingStartTime = millis();
+  crushingActive = true;
+}
+
+/* =====================================================
+   UPDATE CRUSHING → START JUICING
+===================================================== */
+void updateCrushing() {
+
+  if (!crushingActive) return;
+
+  if (millis() - crushingStartTime >= CRUSHING_DURATION) {
+
+    digitalWrite(RELAY_DARBABA, RELAY_OFF);
+    digitalWrite(RELAY_HELZON,  RELAY_OFF);
+    digitalWrite(RELAY_CUTTER,  RELAY_OFF);
+
+    crushingActive = false;
+
+    if (!juicingDone) {
+      delay(JUICER_DELAY_MS);
+      stageJuicing();
+      juicingDone = true;
+    }
+  }
+}
+
+/* =====================================================
+   STAGE 3 : JUICING → SLIDER
+===================================================== */
+void stageJuicing() {
+
+  digitalWrite(RELAY_JUICER, RELAY_ON);
+  delay(JUICER_DURATION);
+  digitalWrite(RELAY_JUICER, RELAY_OFF);
+
+  stageCupSlider(selectedKey);
+
+  processRunning = false;
+  lcd.clear();
+  lcd.print("READY");
+}
+
+/* =====================================================
+   STAGE 4 : CUP SLIDER
+===================================================== */
+void stageCupSlider(char key) {
+
+  bool isSmall = (key == '1');
+  int irTarget = isSmall ? IR_SMALL_PIN : IR_LARGE_PIN;
+
+  digitalWrite(SLIDER_ENA_PIN, LOW);
+  digitalWrite(SLIDER_DIR_PIN, SLIDER_DIR_RIGHT);
+
+  while (digitalRead(irTarget) == HIGH) {
+    stepOnce(SLIDER_STEP_PIN, SLIDER_STEP_DELAY_US);
+  }
+
+  dropCup(isSmall);
+  delay(1000);
+
+  digitalWrite(SLIDER_DIR_PIN, SLIDER_DIR_LEFT);
+  while (digitalRead(LIMIT_SWITCH_PIN) == HIGH) {
+    stepOnce(SLIDER_STEP_PIN, SLIDER_STEP_DELAY_US);
+  }
+
+  digitalWrite(SLIDER_ENA_PIN, HIGH);
+
+  // 🔥 آخر Stage: ضخ العصير
+  stagePumping(key);
+}
+
+
+/* =====================================================
+   HELPERS
+===================================================== */
+void stepOnce(int stepPin, int delayUs) {
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(delayUs);
+}
+
+void dropCup(bool isSmall) {
+
+  int stepPin = isSmall ? CUPS_STEP_PIN : CUPL_STEP_PIN;
+  int enaPin  = isSmall ? CUPS_ENA_PIN  : CUPL_ENA_PIN;
+
+  digitalWrite(enaPin, LOW);
+
+  for (int i = 0; i < CUP_STEPS_360; i++) {
+    stepOnce(stepPin, CUP_STEP_DELAY_US);
+  }
+
+  digitalWrite(enaPin, HIGH);
+}
+
+void stagePumping(char key) {
+
+  delay(1000);
+
+  unsigned long pumpTime = (key == '1') ? PUMP_TIME_SMALL : PUMP_TIME_LARGE;
+
+  digitalWrite(RELAY_PUMP, RELAY_ON);
+  delay(pumpTime);
+  digitalWrite(RELAY_PUMP, RELAY_OFF);
+
+  // 🔥 إنهاء البروسيس بالكامل
+  goToIdleState();
+}
+
+void goToIdleState() {
+
+  // إطفاء كل الريلايات
+  digitalWrite(RELAY_CUTTER,   RELAY_OFF);
+  digitalWrite(RELAY_HELZON,   RELAY_OFF);
+  digitalWrite(RELAY_DARBABA,  RELAY_OFF);
+  digitalWrite(RELAY_JUICER,   RELAY_OFF);
+  digitalWrite(RELAY_CONVEYOR, RELAY_OFF);
+  digitalWrite(RELAY_PUMP,     RELAY_OFF);
+
+  // تعطيل كل الستبرات
+  digitalWrite(SLIDER_ENA_PIN, HIGH);
+  digitalWrite(CUPL_ENA_PIN,   HIGH);
+  digitalWrite(CUPS_ENA_PIN,   HIGH);
+
+  // السيرفو للوضع الآمن
+  gate.write(SERVO_BACKWARD_POS);
+
+  // تصفير Flags
+  processRunning  = false;
+  crushingStarted = false;
+  crushingActive  = false;
+  juicingDone     = false;
+  selectedKey     = 0;
+
+  // شاشة
+  lcd.clear();
+  lcd.print("READY");
+
+  Serial.println("SYSTEM IDLE / READY");
+}
