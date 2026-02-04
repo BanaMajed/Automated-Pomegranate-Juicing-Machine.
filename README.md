@@ -15,7 +15,7 @@ The system integrates mechanical design, electronic control, and embedded softwa
 ## 📸 Prototype
 Final prototype of the automated pomegranate juicer:
 
-![Pomegranate Juicer Prototype](images/final_prototype.jpg)
+![Pomegranate Juicer Prototype](final_prototype.jpg)
 
 ---
 
